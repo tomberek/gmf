@@ -4,11 +4,12 @@ package gmf
 
 /*
 
-#cgo pkg-config: libavcodec libavutil
+#cgo pkg-config: libavcodec libavutil libavformat
 
 #include <string.h>
 #include <stdint.h>
 
+#include "libavformat/avformat.h"
 #include "libavcodec/avcodec.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/samplefmt.h"
@@ -18,12 +19,97 @@ package gmf
 
 #define HAVE_THREADS 1
 
+static enum AVPixelFormat find_fmt_by_hw_type(const enum AVHWDeviceType type);
+static enum AVPixelFormat find_fmt_by_hw_type(const enum AVHWDeviceType type)
+{
+    enum AVPixelFormat fmt;
+
+    switch (type) {
+    case AV_HWDEVICE_TYPE_CUDA:
+        fmt = AV_PIX_FMT_NV12;
+        break;
+    case AV_HWDEVICE_TYPE_VAAPI:
+        fmt = AV_PIX_FMT_VAAPI;
+        break;
+    case AV_HWDEVICE_TYPE_DXVA2:
+        fmt = AV_PIX_FMT_DXVA2_VLD;
+        break;
+    case AV_HWDEVICE_TYPE_D3D11VA:
+        fmt = AV_PIX_FMT_D3D11;
+        break;
+    case AV_HWDEVICE_TYPE_VDPAU:
+        fmt = AV_PIX_FMT_VDPAU;
+        break;
+    case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
+        fmt = AV_PIX_FMT_VIDEOTOOLBOX;
+        break;
+    default:
+        fmt = AV_PIX_FMT_NONE;
+        break;
+    }
+
+    return fmt;
+}
+
+static int hw_decoder_init(AVCodecContext *ctx, char* devtype,char* device);
+static int hw_decoder_init(AVCodecContext *ctx, char* devtype,char* device)
+{
+	// Memory leak!!!
+	AVBufferRef *hw_device_ctx = malloc(sizeof(AVBufferRef));
+
+	enum AVHWDeviceType type;
+	type = av_hwdevice_find_type_by_name(devtype);
+    if (type == AV_HWDEVICE_TYPE_NONE) {
+        fprintf(stderr, "Device type %s is not supported.\n", devtype);
+        fprintf(stderr, "Available device types:");
+        while((type = av_hwdevice_iterate_types(type)) != AV_HWDEVICE_TYPE_NONE)
+            fprintf(stderr, " %s", av_hwdevice_get_type_name(type));
+        fprintf(stderr, "\n");
+        return -1;
+    }
+    int err = 0;
+
+    if ((err = av_hwdevice_ctx_create(&hw_device_ctx, type,
+                                      device, NULL, 0)) < 0) {
+        fprintf(stderr, "Failed to create specified HW device with %s.\n",device);
+        return err;
+    }
+    ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+
+	if (err != 0) {
+		return err;
+	}
+	const AVCodec * decoder = ctx->codec;
+	for (int i = 0;; i++) {
+        const AVCodecHWConfig *config = avcodec_get_hw_config(decoder, i);
+        if (!config) {
+            fprintf(stderr, "Decoder %s does not support device type %s.\n",
+                    decoder->name, av_hwdevice_get_type_name(type));
+            return -1;
+        }
+        if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
+            config->device_type == type) {
+            //hw_pix_fmt = config->pix_fmt;
+			//decoder_ctx->get_format = (config->pix_fmt); // foo(2);
+
+			//ctx->get_format = get_hw_format;
+			ctx->pix_fmt = config->pix_fmt;
+            break;
+        }
+    }
+	return 0;
+}
+
+int IsHW(AVCodecContext * ctx) {
+	return ctx->hw_device_ctx == NULL;
+}
+
+
 static int32_t gmf_select_sample_fmt(AVCodec *codec)
 {
     if (codec && codec->sample_fmts) {
         return codec->sample_fmts[0];
     }
-
     return -1;
 }
 
@@ -174,10 +260,43 @@ var (
 
 type avBprint C.struct_AVBprint
 
+type AVBufferRef C.struct_AVBufferRef
+
 type CodecCtx struct {
 	codec      *Codec
 	avCodecCtx *C.struct_AVCodecContext
 	CgoMemoryManage
+}
+
+// func (cc *CodecCtx) InitHw(devtype string) error {
+// 	t := C.CString(devtype)
+// 	defer C.free(unsafe.Pointer(t))
+// 	ret := C.set_hw_pix_fmt((*C.AVCodecContext)(unsafe.Pointer(cc.avCodecCtx)), t)
+// 	if ret < 0 {
+// 		return fmt.Errorf("%d error code", int(ret))
+// 	}
+// 	return nil
+// }
+
+func (cc *CodecCtx) TrySetHwCtx(devtype, device string) (err error) {
+	// err = cc.InitHw(devtype)
+	// if err != nil {
+	// 	return fmt.Errorf("unable to initialize hw: %s", err.Error())
+	// }
+
+	t := C.CString(devtype)
+	d := C.CString(device)
+	defer C.free(unsafe.Pointer(t))
+	defer C.free(unsafe.Pointer(d))
+	ret := C.hw_decoder_init(cc.avCodecCtx, t, d)
+	if ret < 0 {
+		return fmt.Errorf("Failed to init decoder", int(ret))
+	}
+	if err != nil {
+		return fmt.Errorf("unable to initialize hw")
+	}
+
+	return nil
 }
 
 func NewCodecCtx(codec *Codec, options ...[]*Option) *CodecCtx {
@@ -277,7 +396,9 @@ func (cc *CodecCtx) Close() {
 // @todo
 func (cc *CodecCtx) SetOpt() {
 	// mock
-	C.av_opt_set_int(unsafe.Pointer(cc.avCodecCtx), C.CString("refcounted_frames"), 1, 0)
+	refcount := C.CString("refcounted_frames")
+	C.av_opt_set_int(unsafe.Pointer(cc.avCodecCtx), refcount, 1, 0)
+	C.free(unsafe.Pointer(refcount))
 }
 
 func (cc *CodecCtx) Codec() *Codec {
@@ -570,18 +691,37 @@ func (cc *CodecCtx) Decode(pkt *Packet) ([]*Frame, error) {
 	}
 
 	for {
+		sw_frame := NewFrame()
 		frame := NewFrame()
 
 		ret = int(C.avcodec_receive_frame(cc.avCodecCtx, frame.avFrame))
 		if AvErrno(ret) == syscall.EAGAIN || ret == AVERROR_EOF {
 			frame.Free()
+			sw_frame.Free()
 			break
 		} else if ret < 0 {
 			frame.Free()
+			sw_frame.Free()
 			return nil, AvError(ret)
 		}
 
-		result = append(result, frame)
+		if frame.Format() != 0 && frame.Format() == int(cc.PixFmt()) {
+			ret := C.av_hwframe_transfer_data((*C.struct_AVFrame)(unsafe.Pointer(sw_frame.avFrame)), frame.avFrame, 0)
+			if ret < 0 {
+				panic("fail to transfer")
+			}
+			// TODO
+			// fmt.Printf("sw: %#v\n", sw_frame)
+			// fmt.Printf("%#v\n", frame)
+			// fmt.Printf("sw: %#v\n", sw_frame.Format())
+			// fmt.Printf("%#v\n", frame.Format())
+			result = append(result, sw_frame)
+			frame.Unref()
+			frame.Free()
+		} else {
+
+			result = append(result, frame)
+		}
 	}
 
 	return result, nil
